@@ -1,0 +1,4 @@
+build/
+.build/
+homebrew-tap/
+.DS_Store
