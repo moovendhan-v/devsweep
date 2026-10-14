@@ -6,14 +6,34 @@ import SwiftUI
 enum SidebarItem: String, Hashable, CaseIterable {
     case smartCare = "Smart Care"
     case overview = "Dashboard"
+    // Cleanup
     case junk = "System Junk"
     case caches = "Developer Caches"
     case projects = "Project Folders"
+    case history = "Clean History"
+    // Protection
+    case malware = "Malware Removal"
+    case privacy = "Privacy"
+    case browserExtensions = "Browser Extensions"
+    case wifi = "Saved Wi-Fi"
+    case permissions = "App Permissions"
+    // Speed
+    case memory = "Memory & Swap"
+    case optimization = "Optimization"
+    case performance = "Maintenance"
+    case network = "Network"
+    // Applications
+    case apps = "Uninstaller"
+    case updater = "Updater"
+    case extensions = "Extensions"
+    case defaultApps = "Default Apps"
+    // Files
+    case explorer = "Space Lens"
     case largeFiles = "Large & Old Files"
     case duplicates = "Duplicates"
-    case apps = "Uninstaller"
-    case performance = "Performance"
-    case explorer = "Space Lens"
+    case shredder = "Shredder"
+    // Automation
+    case automation = "Scheduled Tasks"
     case activity = "Activity"
 
     var symbol: String {
@@ -23,27 +43,46 @@ enum SidebarItem: String, Hashable, CaseIterable {
         case .junk: "trash.circle"
         case .caches: "hammer.circle"
         case .projects: "folder.badge.gearshape"
+        case .history: "arrow.uturn.backward.circle"
+        case .malware: "shield.lefthalf.filled"
+        case .privacy: "hand.raised.fill"
+        case .browserExtensions: "puzzlepiece"
+        case .wifi: "wifi"
+        case .permissions: "lock.shield"
+        case .memory: "memorychip"
+        case .optimization: "speedometer"
+        case .performance: "wrench.and.screwdriver"
+        case .network: "network"
+        case .apps: "app.badge.checkmark"
+        case .updater: "arrow.triangle.2.circlepath"
+        case .extensions: "puzzlepiece.extension"
+        case .defaultApps: "arrow.up.forward.app"
+        case .explorer: "circle.hexagongrid"
         case .largeFiles: "doc.badge.ellipsis"
         case .duplicates: "square.on.square"
-        case .apps: "app.badge.checkmark"
-        case .performance: "bolt.circle"
-        case .explorer: "circle.hexagongrid"
+        case .shredder: "scissors"
+        case .automation: "calendar.badge.clock"
         case .activity: "clock.arrow.circlepath"
         }
     }
 
     var tint: Color {
         switch self {
-        case .smartCare: .pink
+        case .smartCare: AppTheme.current.accent
         case .overview: .indigo
-        case .junk: .green
+        case .junk, .history: .green
         case .caches: .blue
         case .projects: .pink
+        case .malware, .privacy, .browserExtensions, .wifi, .permissions: .red
+        case .memory: .blue
+        case .optimization, .performance: .orange
+        case .network: .teal
+        case .apps, .updater, .extensions, .defaultApps: .cyan
+        case .explorer: .purple
         case .largeFiles: .orange
         case .duplicates: .teal
-        case .apps: .cyan
-        case .performance: .yellow
-        case .explorer: .purple
+        case .shredder: .gray
+        case .automation: .indigo
         case .activity: .gray
         }
     }
@@ -63,6 +102,19 @@ final class Store {
     let apps = AppsModel()
     let performance = PerformanceModel()
     let trash = TrashModel()
+    let memory = MemoryMonitor()
+    let system = SystemMonitor()
+    let malware = MalwareModel()
+    let privacy = PrivacyModel()
+    let wifi = WiFiModel()
+    let permissions = PermissionsModel()
+    let browserExtensions = BrowserExtensionsModel()
+    let updater = UpdaterModel()
+    let extensions = ExtensionsModel()
+    let defaultApps = DefaultAppsModel()
+    let shredder = ShredderModel()
+    let automation = AutomationModel()
+    var history: [CleanSession] = CleanHistory.load()
 
     // Cache targets (built-in + discovered at runtime)
     var targets: [CleanTarget] = Catalog.targets
@@ -91,7 +143,7 @@ final class Store {
     var smartDone = false
 
     // Shared
-    var moveToTrash = true
+    var moveToTrash = UserDefaults.standard.object(forKey: "moveToTrashDefault") as? Bool ?? true
     var isCleaning = false
     var log: [String] = []
     var disk = FileOps.diskSpace()
@@ -294,6 +346,11 @@ final class Store {
         await largeFiles.scan(root: home)
         smartProgress = 0.85
 
+        smartStage = "Checking for malware and adware…"
+        await malware.scan()
+        smartStage = "Checking memory and swap…"
+        memory.sample()
+        memory.refreshProcesses()
         smartStage = "Reviewing your apps…"
         await apps.scan()
         performance.refresh()
@@ -377,11 +434,13 @@ final class Store {
         isCleaning = true
         let before = FileOps.diskSpace().free
         let lines = await Task.detached(operation: work).value
+        CleanHistory.commit(label: lines.first { $0.hasPrefix("✓") }.map { String($0.dropFirst(2)) } ?? "Clean")
         disk = FileOps.diskSpace()
         let freed = max(0, disk.free - before)
         let summary = "— \(Date().formatted(date: .abbreviated, time: .shortened)): " +
             (moveToTrash ? "moved to Trash (empty Trash to reclaim space)" : "freed ~\(freed.byteString)")
         log.insert(contentsOf: [summary] + lines, at: 0)
+        history = CleanHistory.load()
         isCleaning = false
         await trash.refresh()
     }

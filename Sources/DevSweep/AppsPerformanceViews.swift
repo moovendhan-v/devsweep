@@ -13,7 +13,9 @@ struct AppsView: View {
     @State private var confirming = false
     @State private var confirmingOrphans = false
 
-    enum Filter: String, CaseIterable { case all = "All Apps", unused = "Unused 90+ days", leftovers = "Leftovers" }
+    enum Filter: String, CaseIterable { case all = "All Apps", unused = "Unused", leftovers = "Leftovers" }
+    @AppStorage("unusedMonths") private var unusedMonths = 3
+    @State private var confirmingReset = false
 
     private var model: AppsModel { store.apps }
 
@@ -27,11 +29,19 @@ struct AppsView: View {
             ModuleHeader(item: .apps,
                          subtitle: "Remove apps completely, including the settings and support files they leave in your Library.",
                          value: model.apps.reduce(0) { $0 + $1.size }, loading: model.isScanning)
-            Picker("", selection: $filter) {
-                ForEach(Filter.allCases, id: \.self) { Text(label(for: $0)).tag($0) }
+            HStack {
+                Picker("", selection: $filter) {
+                    ForEach(Filter.allCases, id: \.self) { Text(label(for: $0)).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                if filter == .unused {
+                    Picker("Not opened for", selection: $unusedMonths) {
+                        Text("3 months").tag(3); Text("6 months").tag(6); Text("12 months").tag(12)
+                    }
+                    .frame(width: 220)
+                }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             .padding(.horizontal, 16).padding(.vertical, 10)
             Divider()
             if model.isScanning && model.apps.isEmpty {
@@ -59,6 +69,11 @@ struct AppsView: View {
         } message: {
             Text("The app and its selected support files go to the Trash. If it's running, DevSweep quits it first.")
         }
+        .confirmationDialog("Reset \(focused?.name ?? "app") to defaults?", isPresented: $confirmingReset) {
+            Button("Reset", role: .destructive) { resetFocused() }
+        } message: {
+            Text("Its caches, preferences, saved state, cookies and logs go to the Trash. The app and your documents stay. Quit it first.")
+        }
         .confirmationDialog("Remove \(model.selection.count) leftover item(s)?", isPresented: $confirmingOrphans) {
             Button("Move to Trash", role: .destructive) {
                 let urls = model.selection
@@ -73,7 +88,7 @@ struct AppsView: View {
     private func label(for filter: Filter) -> String {
         switch filter {
         case .all: "All Apps (\(model.apps.count))"
-        case .unused: "Unused 90+ days (\(model.unused.count))"
+        case .unused: "Unused \(unusedMonths)+ months (\(model.unused.count))"
         case .leftovers: "Leftovers (\(model.orphanBytes.byteString))"
         }
     }
@@ -145,6 +160,9 @@ struct AppsView: View {
                 Divider()
                 HStack {
                     Button("Reveal") { NSWorkspace.shared.reveal([app.url]) }
+                    Button("Reset to Defaults") { confirmingReset = true }
+                        .help("Delete this app's caches and settings but keep the app")
+                        .disabled(leftovers.allSatisfy { !AppReset.isResettable($0.url) })
                     Spacer()
                     Button(role: .destructive) { confirming = true } label: {
                         Label("Uninstall \(totalForFocused.byteString)", systemImage: "trash")
@@ -205,6 +223,19 @@ struct AppsView: View {
         }
     }
 
+    private func resetFocused() {
+        guard let app = focused else { return }
+        let urls = leftovers.map(\.url).filter(AppReset.isResettable)
+        Task {
+            if let bundleID = app.bundleID {
+                for running in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) { running.terminate() }
+                try? await Task.sleep(for: .seconds(1))
+            }
+            await store.trashFiles(urls, label: "Reset \(app.name)")
+            select(app)
+        }
+    }
+
     private func uninstall() {
         guard let app = focused else { return }
         let urls = [app.url] + Array(leftoverSelection)
@@ -223,173 +254,193 @@ struct AppsView: View {
     }
 }
 
-// MARK: - Performance
+// MARK: - Maintenance
 
 struct PerformanceView: View {
     @Environment(Store.self) private var store
-    @State private var taskResult: String?
-    @State private var confirmRemove: LaunchItem?
-
+    @State private var confirmTask: Maintenance?
     private var model: PerformanceModel { store.performance }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                ModuleHeader(item: .performance, subtitle: "Memory, heavy apps, background items and maintenance tasks.")
+                ModuleHeader(item: .performance, subtitle: "macOS housekeeping scripts. Safe tasks can run together with a single admin password.")
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                HStack(alignment: .top, spacing: 18) {
-                    memoryCard
-                    tasksCard
+                HStack {
+                    Text("Safe tasks").font(.title3.weight(.semibold))
+                    Spacer()
+                    Button {
+                        Task { _ = await model.runSafeTasks() }
+                    } label: {
+                        Label(model.runningTask == "safe" ? "Running…" : "Run All Safe Tasks", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.runningTask != nil)
                 }
-                .fixedSize(horizontal: false, vertical: true)
-                heavyApps
-                launchItems
+                taskList(model.tasks.filter { $0.severity == .safe })
+                Text("Advanced").font(.title3.weight(.semibold)).padding(.top, 6)
+                taskList(model.tasks.filter { $0.severity == .advanced })
+                memoryLink
             }
             .padding(24)
         }
-        .navigationTitle("Performance")
-        .toolbar {
-            Button { model.refresh() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
-        }
-        .onAppear { model.refresh() }
-        .confirmationDialog("Remove “\(confirmRemove?.label ?? "")”?", isPresented: Binding(
-            get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } })) {
-            Button("Move to Trash", role: .destructive) {
-                if let item = confirmRemove {
-                    Task {
-                        await store.trashFiles([item.url], label: "Launch agent")
-                        model.refresh()
-                    }
-                }
-            }
+        .navigationTitle("Maintenance")
+        .confirmationDialog("Run “\(confirmTask?.name ?? "")”?", isPresented: Binding(get: { confirmTask != nil }, set: { if !$0 { confirmTask = nil } })) {
+            Button("Run", role: .destructive) { if let task = confirmTask { Task { _ = await model.run(task) } } }
         } message: {
-            Text("The item stops launching at your next login. Its app may re-create it when you open it.")
+            Text(confirmTask?.sideEffect ?? "")
         }
     }
 
-    private var memoryCard: some View {
+    private func taskList(_ tasks: [Maintenance]) -> some View {
         Card {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Memory").font(.headline)
-                HStack(spacing: 22) {
-                    Gauge(value: model.memoryPressure) {
-                        EmptyView()
-                    } currentValueLabel: {
-                        Text("\(Int(model.memoryPressure * 100))%").font(.title2.weight(.bold)).monospacedDigit()
-                    }
-                    .gaugeStyle(.accessoryCircularCapacity)
-                    .tint(model.memoryPressure > 0.85 ? .red : model.memoryPressure > 0.7 ? .orange : .green)
-                    .scaleEffect(1.6)
-                    .frame(width: 90, height: 90)
-                    VStack(alignment: .leading, spacing: 6) {
-                        row("Used", model.memoryUsed)
-                        row("Compressed", model.memoryCompressed)
-                        row("Swap", model.swapUsed)
-                        row("Installed", model.memoryTotal)
-                    }
-                }
-            }
-        }
-    }
-
-    private func row(_ title: String, _ bytes: Int64) -> some View {
-        HStack {
-            Text(title).foregroundStyle(.secondary)
-            Spacer()
-            Text(bytes.byteString).monospacedDigit()
-        }
-        .font(.callout)
-        .frame(width: 200)
-    }
-
-    private var tasksCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Maintenance").font(.headline)
-                ForEach(model.tasks) { task in
-                    HStack(spacing: 10) {
-                        IconBadge(symbol: task.symbol, color: .yellow, size: 26)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(task.name).fontWeight(.medium)
-                            Text(task.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            VStack(spacing: 0) {
+                ForEach(Array(tasks.enumerated()), id: \.element.id) { index, task in
+                    if index > 0 { Divider() }
+                    HStack(spacing: 12) {
+                        IconBadge(symbol: task.symbol, color: task.severity == .safe ? .green : .orange, size: 30)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(task.name).fontWeight(.medium)
+                                if task.admin { Image(systemName: "lock.fill").font(.caption2).foregroundStyle(.secondary).help("Asks for your admin password") }
+                            }
+                            Text(task.detail).font(.caption).foregroundStyle(.secondary)
+                            if let result = model.results[task.id] { Text(result).font(.caption2).foregroundStyle(result.hasPrefix("✓") ? .green : .orange) }
                         }
                         Spacer()
-                        Button(model.runningTask == task.id ? "Running…" : "Run") {
-                            Task {
-                                let ok = await model.run(task)
-                                taskResult = ok ? "✓ \(task.name) finished" : "\(task.name) was cancelled"
+                        if model.runningTask == task.id {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Run") {
+                                if task.severity == .advanced { confirmTask = task } else { Task { _ = await model.run(task) } }
                             }
+                            .disabled(model.runningTask != nil)
                         }
-                        .disabled(model.runningTask != nil)
                     }
-                }
-                Text(taskResult ?? "macOS asks for your admin password before running these.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var heavyApps: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Heavy apps").font(.title3.weight(.semibold))
-            Card {
-                VStack(spacing: 0) {
-                    let maxMemory = Double(max(model.topApps.first?.memory ?? 1, 1))
-                    ForEach(Array(model.topApps.prefix(10).enumerated()), id: \.element.id) { index, app in
-                        if index > 0 { Divider().padding(.leading, 40) }
-                        HStack(spacing: 10) {
-                            if let url = app.bundleURL { FileIcon(url: url, size: 26) }
-                            Text(app.name).fontWeight(.medium)
-                            Spacer()
-                            SizeBar(fraction: Double(app.memory) / maxMemory, color: .yellow).frame(width: 120)
-                            Text(app.memory.byteString).monospacedDigit().frame(width: 80, alignment: .trailing)
-                            Button("Quit") { model.quit(app) }.controlSize(.small)
-                        }
-                        .padding(.vertical, 7)
-                    }
+                    .padding(.vertical, 8)
                 }
             }
         }
     }
 
-    private var launchItems: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Background items (\(model.launchItems.count))").font(.title3.weight(.semibold))
+    private var memoryLink: some View {
+        let snap = store.memory.current
+        return Card {
+            HStack(spacing: 14) {
+                IconBadge(symbol: "memorychip", color: .blue, size: 34)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Free Up RAM lives in Memory & Swap").fontWeight(.medium)
+                    Text("\(Int(snap.usedFraction * 100))% used · \(snap.swapUsed.byteString) swap · pressure \(snap.pressure.label.lowercased())")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Spacer()
-                Button("Open Login Items Settings") {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!)
-                }
+                Button("Open") { store.section = .memory }
             }
-            Card {
-                VStack(spacing: 0) {
-                    if model.launchItems.isEmpty {
-                        Text("No launch agents found.").foregroundStyle(.secondary).padding()
-                    }
-                    ForEach(Array(model.launchItems.enumerated()), id: \.element.id) { index, item in
-                        if index > 0 { Divider() }
-                        HStack(spacing: 10) {
-                            Image(systemName: item.isUser ? "person.crop.circle" : "gearshape.2")
-                                .foregroundStyle(.secondary).frame(width: 22)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(item.label).fontWeight(.medium).lineLimit(1)
-                                Text(item.program.isEmpty ? item.url.tildePath : item.program)
-                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+        }
+    }
+}
+
+// MARK: - Optimization
+
+struct OptimizationView: View {
+    @Environment(Store.self) private var store
+    @State private var tab = 0
+    @State private var message: String?
+    @State private var search = ""
+    private var model: PerformanceModel { store.performance }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ModuleHeader(item: .optimization, subtitle: "Control what starts with your Mac and find processes burning CPU.")
+            Picker("", selection: $tab) {
+                Text("Startup Items (\(model.startupItems.count))").tag(0)
+                Text("CPU Hogs").tag(1)
+            }
+            .pickerStyle(.segmented).labelsHidden().padding(.horizontal, 16).padding(.vertical, 10)
+            if let message { Text(message).font(.callout).padding(6).frame(maxWidth: .infinity).background(.quaternary.opacity(0.4)) }
+            Divider()
+            if tab == 0 { startup } else { cpu }
+        }
+        .navigationTitle("Optimization")
+        .searchable(text: $search, placement: .toolbar, prompt: "Filter")
+        .toolbar {
+            Button("Login Items Settings") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!) }
+            Button { model.refresh(); Task { await model.refreshCPU() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+        }
+        .onAppear { model.refresh() }
+        .task(id: tab) {
+            guard tab == 1 else { return }
+            while !Task.isCancelled {
+                await model.refreshCPU()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    private var startup: some View {
+        List {
+            ForEach([StartupItem.Kind.loginItem, .agent, .daemon], id: \.self) { kind in
+                let items = model.startupItems.filter { $0.kind == kind && (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.label.localizedCaseInsensitiveContains(search)) }
+                if !items.isEmpty {
+                    SwiftUI.Section("\(kind.rawValue)s · \(items.count)") {
+                        ForEach(items) { item in
+                            HStack(spacing: 10) {
+                                if let app = item.appURL { FileIcon(url: app, size: 26) } else { Image(systemName: "gearshape.2").frame(width: 26).foregroundStyle(.secondary) }
+                                VStack(alignment: .leading, spacing: 1) {
+                                    HStack {
+                                        Text(item.name).fontWeight(.medium).lineLimit(1)
+                                        if !item.isUser { Tag(text: "All users", color: .secondary) }
+                                    }
+                                    Text(item.program.isEmpty ? item.label : item.program).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                                }
+                                Spacer()
+                                if let plist = item.plist {
+                                    Button { NSWorkspace.shared.reveal([plist]) } label: { Image(systemName: "magnifyingglass") }.buttonStyle(.borderless)
+                                }
+                                Toggle("", isOn: Binding(get: { item.enabled }, set: { on in Task { message = await model.setEnabled(item, on) } }))
+                                    .toggleStyle(.switch).controlSize(.small).labelsHidden()
+                                    .disabled(!item.isUser)
+                                    .help(item.isUser ? "" : "System-wide items are managed in System Settings")
                             }
-                            Spacer()
-                            Tag(text: item.scope, color: item.isUser ? .blue : .secondary)
-                            Button { NSWorkspace.shared.reveal([item.url]) } label: { Image(systemName: "magnifyingglass") }
-                                .buttonStyle(.borderless)
-                            if item.isUser {
-                                Button { confirmRemove = item } label: { Image(systemName: "trash") }
-                                    .buttonStyle(.borderless)
-                                    .help("Stop this from launching")
-                            }
+                            .padding(.vertical, 2)
                         }
-                        .padding(.vertical, 7)
                     }
                 }
             }
         }
+        .listStyle(.inset)
+    }
+
+    private var cpu: some View {
+        let procs = model.cpuProcesses.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }.prefix(40)
+        let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
+        return List {
+            SwiftUI.Section("CPU now: \(Int(store.system.cpu * 100))% across \(Int(cores)) cores") {
+                ForEach(Array(procs)) { proc in
+                    HStack(spacing: 10) {
+                        if let app = proc.appURL { FileIcon(url: app, size: 22) } else { Image(systemName: "gearshape").frame(width: 22).foregroundStyle(.secondary) }
+                        Text(proc.name).lineLimit(1)
+                        Text("pid \(proc.pid) · \(proc.threads) threads").font(.caption).foregroundStyle(.tertiary)
+                        Spacer()
+                        SizeBar(fraction: proc.cpu / cores, color: proc.cpu > 0.8 ? .red : .orange).frame(width: 120)
+                        Text("\(Int(proc.cpu * 100))%").monospacedDigit().frame(width: 50, alignment: .trailing)
+                        if getuid() == uidOf(proc.pid) {
+                            Menu("Quit") {
+                                Button("Quit") { kill(proc.pid, SIGTERM) }
+                                Button("Force Quit", role: .destructive) { kill(proc.pid, SIGKILL) }
+                            }
+                            .menuStyle(.borderedButton).fixedSize().controlSize(.small)
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.inset)
+        .overlay { if model.cpuProcesses.isEmpty { ProgressView("Sampling CPU…") } }
+    }
+
+    private func uidOf(_ pid: pid_t) -> uid_t {
+        var info = proc_bsdinfo()
+        return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 ? info.pbi_uid : 0
     }
 }

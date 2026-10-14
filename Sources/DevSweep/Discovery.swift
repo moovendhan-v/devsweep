@@ -34,7 +34,8 @@ enum Discovery {
 
         let known = targets
         let discovered = await Task.detached { discoverOnDisk(excluding: known) }.value
-        return targets + discovered
+        let extra = await Task.detached { DiscoveryExtra.targets() }.value
+        return targets + discovered + extra
     }
 
     // MARK: - Tool probes

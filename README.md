@@ -2,7 +2,8 @@
 
 # DevSweep
 
-A native macOS (SwiftUI, macOS 14+, Apple Silicon & Intel) cleaner for developers, modelled on CleanMyMac's layout.
+A native macOS (SwiftUI, macOS 14+, Apple Silicon & Intel) cleaner and system monitor for developers.
+Includes logic adapted from [Mac Sai](https://github.com/iliyami/MacSai) (BSD 3-Clause); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Install
 
@@ -13,19 +14,30 @@ brew install --cask moovendhan-v/tap/devsweep
 
 Update with `brew upgrade --cask devsweep`; remove with `brew uninstall --cask devsweep` (add `--zap` to also delete its settings).
 
-| Module | What it does |
+| Section | Modules |
 | --- | --- |
-| **Smart Care** | One-click checkup across every module, then a checklist with a single **Run** for the safe items. |
-| **Dashboard** | Disk usage bar, reclaimable total, breakdown chart, biggest space users. |
-| **System Junk** | App caches, browser & Electron caches, logs, unfinished downloads, old installers, Trash. |
-| **Developer Caches** | Xcode, npm/yarn/pnpm/bun/deno, pip/uv/conda, Homebrew, Cargo, Go, Gradle/Maven, Docker, editors and AI tools. |
-| **Project Folders** | `node_modules`, `.build`, `Pods`, `target`, `.terraform`, `.venv`, … in a folder tree with an age filter. |
-| **Large & Old Files** | Files over 50 MB in your home folder (including hidden VM disks), filtered by type, size and last use. |
-| **Duplicates** | Identical files matched by SHA-256 of their contents; keeps the newest copy by default. |
-| **Uninstaller** | Apps with size and last use, plus their leftovers in ~/Library; also finds leftovers of apps already deleted. |
-| **Performance** | Memory pressure, heavy apps (Quit), launch agents, admin maintenance tasks (purge RAM, flush DNS, reindex Spotlight). |
-| **Space Lens** | Treemap or list of any folder, sorted by size, with breadcrumbs. |
-| **Menu bar** | Free space at a glance, Smart Scan and shortcuts. |
+| **Smart Care** | One-click checkup (junk, dev caches, projects, large files, malware, memory, apps) → checklist → **Run**. |
+| **Cleanup** | System Junk (app/browser/Electron caches, logs, mail attachments, iOS backups, old updates, temp files, broken prefs & login items, leftovers of deleted apps, deleted users, unused languages, universal-binary thinning, Trash), Developer Caches (found dynamically), Project Folders, **Clean History** with one-click Restore. |
+| **Protection** | Malware scan (Quick/Balanced/Deep, signatures + unsigned/suspicious launch items, real-time watcher), Privacy (browser history, caches, cookies, form data, recent items), Browser Extensions, Saved Wi-Fi, App Permissions overview. |
+| **Speed** | Memory & Swap (live breakdown, pressure, swap files, history, Speed Up), Optimization (login items & launch agents on/off, CPU hogs), Maintenance (flush DNS, purgeable space, verify disk, Launch Services, Spotlight, Time Machine snapshots, fonts, Mail; "Run All Safe Tasks" with one password), **Network** (live speed, today by hour, 7/30/90-day history, per-app traffic). |
+| **Applications** | Uninstaller (+ Reset to Defaults, unused 3/6/12 months, leftovers of deleted apps), Updater (Homebrew casks + Sparkle feeds), Extensions (pref panes, plug-ins, Quick Look, Spotlight, app extensions), Default Apps. |
+| **Files** | Space Lens treemap, Large & Old Files, Duplicates (+ APFS-clone consolidation), Shredder. |
+| **Automation** | Scheduled tasks (dev caches, junk, DerivedData, brew cleanup, Docker prune, stale node_modules, empty Trash, network/disk reports, custom commands) via a background agent; optional daily wake; Keep Mac Awake. |
+| **Menu bar** | CPU / memory / disk / battery rings, ↓↑ network speed, data used today, tips, external drives, Keep Awake, Free RAM. Label can show RAM, CPU, network speed, data today or free disk. |
+| **Onboarding** | First-launch guide for Full Disk Access, background activity, open at login and notifications. |
+
+### Running in the background
+
+While a Mac sleeps no app can run. DevSweep: (1) keeps the Mac awake while a task runs, (2) registers a background
+agent with `SMAppService` (macOS shows "App Background Activity" and lists it in Login Items & Extensions) that checks
+every 15 minutes and immediately after wake, and (3) can schedule a daily `pmset` wake so tasks run at their time.
+
+### About swap
+
+macOS manages swap itself: the kernel creates and deletes `/System/Volumes/VM/swapfile*` as needed, on a volume
+protected by System Integrity Protection. No app can safely create, resize or delete swap files. DevSweep shows exactly
+how much swap is used and how fast it's being read and written, and shrinks it the safe ways: freeing RAM, quitting
+heavy apps, or restarting (which clears all swap).
 
 ## Dynamic cache discovery
 

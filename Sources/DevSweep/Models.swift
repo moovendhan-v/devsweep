@@ -12,7 +12,10 @@ enum TargetGroup: String, CaseIterable, Identifiable, Sendable {
     case appCaches = "App Caches"
     case webCaches = "Browser & Electron Caches"
     case logs = "Logs & Crash Reports"
-    case downloads = "Downloads"
+    case mail = "Mail Attachments"
+    case downloads = "Downloads, Backups & Installers"
+    case broken = "Broken & Orphaned Files"
+    case slimming = "App Slimming"
 
     var id: String { rawValue }
 
@@ -38,6 +41,9 @@ enum TargetGroup: String, CaseIterable, Identifiable, Sendable {
         case .webCaches: "globe"
         case .logs: "doc.text.magnifyingglass"
         case .downloads: "arrow.down.circle"
+        case .mail: "paperclip"
+        case .broken: "bandage"
+        case .slimming: "scissors"
         }
     }
 }
@@ -64,6 +70,8 @@ struct CleanTarget: Identifiable, Hashable, Sendable {
         case contents
         /// Remove the listed paths themselves (stray files such as broken downloads).
         case items
+        /// Strip CPU architectures this Mac can't run from the listed app bundles (`lipo -thin`).
+        case thin
     }
 
     let id: String

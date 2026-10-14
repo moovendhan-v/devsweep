@@ -59,11 +59,17 @@ enum FileOps {
     /// Returns an error message, or nil on success.
     static func remove(_ url: URL, toTrash: Bool) -> String? {
         do {
+            try SafetyGuard.validate(url)
             if toTrash {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                let bytes = size(of: url)
+                var resulting: NSURL?
+                try FileManager.default.trashItem(at: url, resultingItemURL: &resulting)
+                if let trashed = resulting as URL? { CleanHistory.note(original: url, trashed: trashed, bytes: bytes) }
             } else {
                 try FileManager.default.removeItem(at: url)
             }
+            return nil
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
             return nil
         } catch {
             return "\(url.lastPathComponent): \(error.localizedDescription)"
@@ -123,6 +129,7 @@ enum FileOps {
         switch target.mode {
         case .contents: target.existingURLs.flatMap { clearContents(of: $0, toTrash: toTrash) }
         case .items: target.existingURLs.compactMap { remove($0, toTrash: toTrash) }
+        case .thin: target.existingURLs.compactMap { AppSlimming.thin($0) }
         }
     }
 

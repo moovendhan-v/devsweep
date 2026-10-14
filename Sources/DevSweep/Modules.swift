@@ -272,7 +272,8 @@ struct InstalledApp: Identifiable, Hashable, Sendable {
     /// Only flagged when we actually know the last-used date.
     var isUnused: Bool {
         guard let lastUsed else { return false }
-        return lastUsed < Date.now.addingTimeInterval(-90 * 86_400)
+        let months = max(UserDefaults.standard.integer(forKey: "unusedMonths"), 3)
+        return lastUsed < Calendar.current.date(byAdding: .month, value: -months, to: .now)!
     }
 }
 
@@ -419,14 +420,6 @@ extension Array {
 
 // MARK: - Performance
 
-struct RunningApp: Identifiable, Hashable {
-    let pid: pid_t
-    let name: String
-    let bundleURL: URL?
-    let memory: Int64
-    var id: pid_t { pid }
-}
-
 struct LaunchItem: Identifiable, Hashable, Sendable {
     let url: URL
     let label: String
@@ -447,87 +440,63 @@ struct MaintenanceTask: Identifiable {
 @MainActor
 @Observable
 final class PerformanceModel {
-    private(set) var memoryUsed: Int64 = 0
-    private(set) var memoryTotal: Int64 = Int64(ProcessInfo.processInfo.physicalMemory)
-    private(set) var memoryCompressed: Int64 = 0
-    private(set) var swapUsed: Int64 = 0
-    private(set) var topApps: [RunningApp] = []
     private(set) var launchItems: [LaunchItem] = []
+    private(set) var startupItems: [StartupItem] = []
+    private(set) var cpuProcesses: [ProcessCPU] = []
     var runningTask: String?
+    var results: [String: String] = [:]
 
-    let tasks: [MaintenanceTask] = [
-        MaintenanceTask(id: "ram", name: "Free Up RAM", detail: "Purges inactive memory so apps that need RAM get it.",
-                        symbol: "memorychip", script: "/usr/sbin/purge"),
-        MaintenanceTask(id: "dns", name: "Flush DNS Cache", detail: "Fixes sites that won't load after network or DNS changes.",
-                        symbol: "network", script: "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder"),
-        MaintenanceTask(id: "spotlight", name: "Reindex Spotlight", detail: "Rebuilds the search index when Spotlight results are wrong. Takes a while.",
-                        symbol: "magnifyingglass", script: "/usr/bin/mdutil -E /"),
-        MaintenanceTask(id: "launchservices", name: "Rebuild Launch Services", detail: "Fixes duplicate apps in “Open With” menus.",
-                        symbol: "list.bullet.rectangle",
-                        script: "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -kill -r -domain local -domain system -domain user"),
-    ]
-
-    var memoryPressure: Double { Double(memoryUsed) / Double(max(memoryTotal, 1)) }
+    let tasks = Maintenance.all.filter(\.isAvailable)
 
     func refresh() {
-        readMemory()
-        topApps = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular && $0.processIdentifier != getpid() }
-            .map { RunningApp(pid: $0.processIdentifier, name: $0.localizedName ?? "App",
-                              bundleURL: $0.bundleURL, memory: Self.footprint(of: $0.processIdentifier)) }
-            .sorted { $0.memory > $1.memory }
         Task {
-            launchItems = await Task.detached { PerformanceModel.findLaunchItems() }.value
+            async let launch = Task.detached { PerformanceModel.findLaunchItems() }.value
+            async let startup = Task.detached { PerformanceModel.findStartupItems() }.value
+            launchItems = await launch
+            startupItems = await startup
         }
     }
 
-    func quit(_ app: RunningApp) {
-        NSRunningApplication(processIdentifier: app.pid)?.terminate()
-        Task {
-            try? await Task.sleep(for: .seconds(1.5))
-            refresh()
-        }
+    func refreshCPU() async {
+        cpuProcesses = await Task.detached { PerformanceModel.sampleCPU() }.value
     }
 
-    /// Runs a maintenance task with an admin password prompt from macOS.
-    func run(_ task: MaintenanceTask) async -> Bool {
-        runningTask = task.id
-        let script = task.script.replacingOccurrences(of: "\"", with: "\\\"")
-        let ok = await Task.detached { () -> Bool in
-            var error: NSDictionary?
-            NSAppleScript(source: "do shell script \"\(script)\" with administrator privileges")?.executeAndReturnError(&error)
-            return error == nil
-        }.value
-        runningTask = nil
+    func setEnabled(_ item: StartupItem, _ on: Bool) async -> String {
+        let message = await Task.detached { PerformanceModel.setEnabled(item, on) }.value
         refresh()
+        return message
+    }
+
+    func run(_ task: Maintenance) async -> Bool {
+        runningTask = task.id
+        let ok: Bool
+        if task.admin {
+            ok = await Admin.run(task.command)
+        } else {
+            let command = task.command
+            let result = await Task.detached { FileOps.run(command, timeout: 3600) }.value
+            ok = result.ok
+            if !result.output.isEmpty { results[task.id] = String(result.output.suffix(400)) }
+        }
+        results[task.id] = (ok ? "✓ Done " : "✗ Failed or cancelled ") + Date().formatted(date: .omitted, time: .shortened)
+        runningTask = nil
         return ok
     }
 
-    private func readMemory() {
-        var stats = vm_statistics64()
-        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
-        let result = withUnsafeMutablePointer(to: &stats) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
-            }
+    /// Runs every safe task in order with a single admin password prompt.
+    func runSafeTasks() async -> Bool {
+        let safe = tasks.filter { $0.severity == .safe }
+        runningTask = "safe"
+        let user = safe.filter { !$0.admin }
+        for task in user { _ = await run(task) }
+        runningTask = "safe"
+        let combined = safe.filter(\.admin).map(\.command).joined(separator: " ; ")
+        let ok = combined.isEmpty ? true : await Admin.run(combined)
+        for task in safe where task.admin {
+            results[task.id] = (ok ? "✓ Done " : "✗ Cancelled ") + Date().formatted(date: .omitted, time: .shortened)
         }
-        guard result == KERN_SUCCESS else { return }
-        let page = Int64(vm_kernel_page_size)
-        let app = Int64(stats.internal_page_count) - Int64(stats.purgeable_count)
-        memoryUsed = (app + Int64(stats.wire_count) + Int64(stats.compressor_page_count)) * page
-        memoryCompressed = Int64(stats.compressor_page_count) * page
-
-        var swap = xsw_usage()
-        var size = MemoryLayout<xsw_usage>.size
-        if sysctlbyname("vm.swapusage", &swap, &size, nil, 0) == 0 { swapUsed = Int64(swap.xsu_used) }
-    }
-
-    private static func footprint(of pid: pid_t) -> Int64 {
-        var info = rusage_info_v4()
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
-        }
-        return result == 0 ? Int64(info.ri_phys_footprint) : 0
+        runningTask = nil
+        return ok
     }
 
     nonisolated static func findLaunchItems() -> [LaunchItem] {
@@ -546,5 +515,132 @@ final class PerformanceModel {
             }
         }
         return items.sorted { ($0.scope, $0.label) < ($1.scope, $1.label) }
+    }
+}
+
+// MARK: - Shredder & duplicate consolidation
+// Secure-erase modes and APFS clone consolidation adapted from Mac Sai (https://github.com/iliyami/MacSai),
+// Copyright (c) 2026, Mac Sai Contributors, BSD 3-Clause License.
+
+@MainActor
+@Observable
+final class ShredderModel {
+    enum Mode: String, CaseIterable, Identifiable {
+        case trash = "Move to Trash", delete = "Delete Permanently", overwrite = "Overwrite, then Delete"
+        var id: String { rawValue }
+        var detail: String {
+            switch self {
+            case .trash: "Recoverable from the Trash."
+            case .delete: "Removed immediately. Not recoverable from the Trash."
+            case .overwrite: "Each file is overwritten with zeros before deletion. On SSDs this is best-effort: the drive may keep old copies internally, so FileVault is the real protection."
+            }
+        }
+    }
+
+    var files: [URL] = []
+    var mode: Mode = .delete
+    private(set) var isRunning = false
+
+    var total: Int64 { files.reduce(0) { $0 + FileOps.size(of: $1) } }
+
+    func add(_ urls: [URL]) {
+        let existing = Set(files)
+        files += urls.filter { !existing.contains($0) }
+    }
+
+    func shred() async -> [String] {
+        isRunning = true
+        let files = self.files, mode = self.mode
+        let lines = await Task.detached { () -> [String] in
+            files.map { url in
+                do {
+                    try SafetyGuard.validate(url)
+                    switch mode {
+                    case .trash:
+                        if let error = FileOps.remove(url, toTrash: true) { return "✗ \(error)" }
+                    case .delete:
+                        try FileManager.default.removeItem(at: url)
+                    case .overwrite:
+                        try ShredderModel.overwrite(url)
+                        try FileManager.default.removeItem(at: url)
+                    }
+                    return "✓ Shredded \(url.lastPathComponent)"
+                } catch {
+                    return "✗ \(url.lastPathComponent): \(error.localizedDescription)"
+                }
+            }
+        }.value
+        self.files.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
+        isRunning = false
+        return lines
+    }
+
+    nonisolated static func overwrite(_ url: URL) throws {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
+        if isDir.boolValue {
+            for child in (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? [] { try overwrite(child) }
+            return
+        }
+        guard (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true else { return }
+        let size = (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        guard size > 0 else { return }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        let chunk = Data(count: min(size, 1 << 20))
+        var remaining = size
+        while remaining > 0 {
+            let n = min(remaining, chunk.count)
+            try handle.write(contentsOf: chunk.prefix(n))
+            remaining -= n
+        }
+        try handle.synchronize()
+    }
+}
+
+extension DuplicatesModel {
+    /// Replaces each selected duplicate with an APFS clone of the copy being kept: every path stays,
+    /// the data is stored once. Returns (bytes reclaimed, problems).
+    func consolidateSelected() async -> (Int64, [String]) {
+        let plan: [(keep: URL, copies: [URL])] = groups.compactMap { group in
+            let copies = group.files.map(\.url).filter { selection.contains($0) }
+            guard let keep = group.files.map(\.url).first(where: { !selection.contains($0) }), !copies.isEmpty else { return nil }
+            return (keep, copies)
+        }
+        let result = await Task.detached { () -> (Int64, [String]) in
+            var reclaimed: Int64 = 0
+            var problems: [String] = []
+            for (keep, copies) in plan {
+                for copy in copies {
+                    do {
+                        try SafetyGuard.validate(copy)
+                        let values = try copy.resourceValues(forKeys: [.volumeSupportsFileCloningKey, .totalFileAllocatedSizeKey])
+                        guard values.volumeSupportsFileCloning == true else { problems.append("\(copy.lastPathComponent): volume can't clone"); continue }
+                        guard FileManager.default.contentsEqual(atPath: keep.path, andPath: copy.path) else {
+                            problems.append("\(copy.lastPathComponent): changed since the scan, skipped")
+                            continue
+                        }
+                        let temp = copy.deletingLastPathComponent().appendingPathComponent(".\(copy.lastPathComponent).clone-\(UUID().uuidString)")
+                        guard clonefile(keep.path, temp.path, 0) == 0 else { problems.append("\(copy.lastPathComponent): clone failed"); continue }
+                        if let attrs = try? FileManager.default.attributesOfItem(atPath: copy.path) {
+                            try? FileManager.default.setAttributes([.posixPermissions: attrs[.posixPermissions] ?? 0o644,
+                                                                    .modificationDate: attrs[.modificationDate] ?? Date()], ofItemAtPath: temp.path)
+                        }
+                        guard rename(temp.path, copy.path) == 0 else {
+                            try? FileManager.default.removeItem(at: temp)
+                            problems.append("\(copy.lastPathComponent): couldn't swap")
+                            continue
+                        }
+                        reclaimed += Int64(values.totalFileAllocatedSize ?? 0)
+                    } catch {
+                        problems.append("\(copy.lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+            }
+            return (reclaimed, problems)
+        }.value
+        selection = []
+        return result
     }
 }

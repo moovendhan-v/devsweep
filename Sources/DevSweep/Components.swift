@@ -14,6 +14,9 @@ extension TargetGroup {
         case .webCaches: .mint
         case .logs: .brown
         case .downloads: .cyan
+        case .mail: .blue
+        case .broken: .red
+        case .slimming: .purple
         }
     }
 }

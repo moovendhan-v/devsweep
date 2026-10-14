@@ -3,6 +3,7 @@ import SwiftUI
 /// One-click 360° checkup: scan everything, show a checklist, run the safe parts.
 struct SmartCareView: View {
     @Environment(Store.self) private var store
+    @Environment(\.theme) private var theme
     @State private var includeTrash = false
     @State private var includeProjects = true
     @State private var lastRunMessage: String?
@@ -40,11 +41,9 @@ struct SmartCareView: View {
 
     private var background: some View {
         ZStack {
-            LinearGradient(colors: [Color(red: 0.20, green: 0.10, blue: 0.36), Color(red: 0.42, green: 0.12, blue: 0.45),
-                                    Color(red: 0.62, green: 0.18, blue: 0.42)],
-                           startPoint: .topLeading, endPoint: .bottomTrailing)
-            Circle().fill(Color.pink.opacity(0.35)).frame(width: 520).blur(radius: 120).offset(x: 260, y: -220)
-            Circle().fill(Color.purple.opacity(0.45)).frame(width: 460).blur(radius: 110).offset(x: -300, y: 260)
+            theme.hero
+            Circle().fill(theme.accent.opacity(0.30)).frame(width: 520).blur(radius: 120).offset(x: 260, y: -220)
+            Circle().fill(theme.accent2.opacity(0.35)).frame(width: 460).blur(radius: 110).offset(x: -300, y: 260)
         }
         .ignoresSafeArea()
     }
@@ -64,10 +63,9 @@ struct SmartCareView: View {
                     Circle().fill(.white.opacity(0.12)).frame(width: 210, height: 210)
                         .scaleEffect(pulse ? 1.08 : 0.96)
                     Circle()
-                        .fill(LinearGradient(colors: [Color(red: 1, green: 0.42, blue: 0.62), Color(red: 0.62, green: 0.32, blue: 1)],
-                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .fill(LinearGradient(colors: [theme.accent, theme.accent2], startPoint: .topLeading, endPoint: .bottomTrailing))
                         .frame(width: 168, height: 168)
-                        .shadow(color: .pink.opacity(0.6), radius: 30)
+                        .shadow(color: theme.accent.opacity(0.6), radius: 30)
                     VStack(spacing: 4) {
                         Image(systemName: "sparkles").font(.system(size: 30, weight: .semibold))
                         Text("Scan").font(.system(size: 26, weight: .bold, design: .rounded))
@@ -87,12 +85,12 @@ struct SmartCareView: View {
                 if let last = store.lastScan {
                     stat("clock", "Last scan", last.formatted(.relative(presentation: .named)))
                 }
-                stat("memorychip", "\(Int(store.performance.memoryPressure * 100))% memory used",
-                     "\(store.performance.memoryTotal.byteString) RAM")
+                stat("memorychip", "\(Int(store.memory.current.usedFraction * 100))% memory used",
+                     "\(store.memory.current.swapUsed.byteString) swap · pressure \(store.memory.current.pressure.label.lowercased())")
             }
             .padding(.top, 6)
         }
-        .onAppear { store.performance.refresh() }
+        .onAppear { store.memory.start() }
     }
 
     private var scanningView: some View {
@@ -102,7 +100,7 @@ struct SmartCareView: View {
                 Circle().stroke(.white.opacity(0.15), lineWidth: 14)
                 Circle()
                     .trim(from: 0, to: max(0.03, store.smartProgress))
-                    .stroke(AngularGradient(colors: [.pink, .purple, .blue, .pink], center: .center),
+                    .stroke(AngularGradient(colors: [theme.accent, theme.accent2, theme.accent], center: .center),
                             style: StrokeStyle(lineWidth: 14, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                     .animation(.smooth(duration: 0.6), value: store.smartProgress)
@@ -122,8 +120,9 @@ struct SmartCareView: View {
                 stageIcon(.caches, done: store.smartProgress >= 0.35)
                 stageIcon(.projects, done: store.smartProgress >= 0.6)
                 stageIcon(.largeFiles, done: store.smartProgress >= 0.85)
+                stageIcon(.malware, done: store.smartProgress >= 0.9)
+                stageIcon(.memory, done: store.smartProgress >= 0.9)
                 stageIcon(.apps, done: store.smartProgress >= 1)
-                stageIcon(.performance, done: store.smartProgress >= 1)
             }
         }
     }
@@ -139,6 +138,8 @@ struct SmartCareView: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 270), spacing: 16)], spacing: 16) {
                 ResultCard(item: .junk, value: store.junkTotal.byteString,
                            detail: "\(store.safeTargets(in: TargetGroup.junk).count) safe app & browser caches") { store.section = .junk }
+                ResultCard(item: .malware, value: store.malware.threats.isEmpty ? "No threats" : "\(store.malware.threats.count) found",
+                           detail: "\(store.malware.scannedCount) items checked") { store.section = .malware }
                 ResultCard(item: .caches, value: store.cacheTotal.byteString,
                            detail: "\(store.devTargets.filter { (store.sizes[$0.id] ?? 0) > 0 }.count) tool caches found") { store.section = .caches }
                 ResultCard(item: .projects, value: store.projectTotal.byteString,
@@ -148,8 +149,8 @@ struct SmartCareView: View {
                            detail: "\(store.largeFiles.files.count) files over 50 MB") { store.section = .largeFiles }
                 ResultCard(item: .apps, value: "\(store.apps.unused.count) unused",
                            detail: "\(store.apps.apps.count) apps · \(store.apps.orphanBytes.byteString) of leftovers") { store.section = .apps }
-                ResultCard(item: .performance, value: "\(Int(store.performance.memoryPressure * 100))% RAM",
-                           detail: "\(store.performance.launchItems.count) background items") { store.section = .performance }
+                ResultCard(item: .memory, value: "\(Int(store.memory.current.usedFraction * 100))% RAM",
+                           detail: "\(store.memory.current.swapUsed.byteString) swap · pressure \(store.memory.current.pressure.label.lowercased())") { store.section = .memory }
             }
 
             VStack(spacing: 14) {
@@ -179,8 +180,8 @@ struct SmartCareView: View {
                             Text("Run · \(recommendedBytes.byteString)").font(.title3.weight(.bold))
                         }
                         .padding(.horizontal, 34).padding(.vertical, 14)
-                        .background(LinearGradient(colors: [.pink, .purple], startPoint: .leading, endPoint: .trailing), in: Capsule())
-                        .shadow(color: .pink.opacity(0.5), radius: 16)
+                        .background(theme.button, in: Capsule())
+                        .shadow(color: theme.accent.opacity(0.5), radius: 16)
                     }
                     .buttonStyle(.plain)
                     .disabled(store.isCleaning || recommendedBytes == 0)

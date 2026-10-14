@@ -35,12 +35,33 @@ for arch in $ARCHS; do
     SLICES+=("build/DevSweep-$arch")
 done
 
-[ -f Resources/AppIcon.icns ] || { swiftc -sdk "$GOOD_SDK" -o build/make_icon scripts/make_icon.swift && build/make_icon "$PWD"; }
+[ -f Resources/AppIcon.icns ] || { swiftc -sdk "$GOOD_SDK" -o build/make_icon scripts/make_icon/main.swift Sources/DevSweep/Theme.swift && build/make_icon "$PWD"; }
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 lipo -create "${SLICES[@]}" -output "$APP/Contents/MacOS/DevSweep"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/"
+
+# Background agent for scheduled tasks, registered at runtime with SMAppService.agent(plistName:).
+mkdir -p "$APP/Contents/Library/LaunchAgents"
+cat > "$APP/Contents/Library/LaunchAgents/com.teamnova.DevSweep.scheduler.plist" <<AGENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.teamnova.DevSweep.scheduler</string>
+    <key>BundleProgram</key><string>Contents/MacOS/DevSweep</string>
+    <key>ProgramArguments</key><array><string>DevSweep</string><string>--run-due-tasks</string></array>
+    <key>AssociatedBundleIdentifiers</key><array><string>com.teamnova.DevSweep</string></array>
+    <key>StartInterval</key><integer>900</integer>
+    <key>RunAtLoad</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityIO</key><true/>
+    <key>Nice</key><integer>10</integer>
+</dict>
+</plist>
+AGENT
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

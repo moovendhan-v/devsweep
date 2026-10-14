@@ -139,6 +139,7 @@ struct LargeFilesView: View {
 struct DuplicatesView: View {
     @Environment(Store.self) private var store
     @State private var confirming = false
+    @State private var confirmingConsolidate = false
 
     private var model: DuplicatesModel { store.duplicates }
 
@@ -169,6 +170,9 @@ struct DuplicatesView: View {
         .navigationSubtitle(model.scannedRoot?.tildePath ?? "")
         .toolbar {
             if model.scannedRoot != nil {
+                Button("Consolidate…") { confirmingConsolidate = true }
+                    .help("Keep every path, but store identical files only once using APFS clones")
+                    .disabled(model.selection.isEmpty)
                 Button("Keep Newest") { model.selectAllButNewest() }
                     .help("Select every copy except the most recently modified one")
                 Button("Choose Folder…", systemImage: "folder") { pick() }
@@ -176,6 +180,17 @@ struct DuplicatesView: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             TrashBar(count: model.selection.count, bytes: model.selectedBytes, disabled: store.isCleaning) { confirming = true }
+        }
+        .confirmationDialog("Consolidate \(model.selection.count) duplicate(s)?", isPresented: $confirmingConsolidate) {
+            Button("Consolidate") {
+                Task {
+                    let (bytes, problems) = await model.consolidateSelected()
+                    store.log.insert("✓ Consolidated duplicates: reclaimed \(bytes.byteString)" + (problems.isEmpty ? "" : " (\(problems.count) skipped)"), at: 0)
+                    store.disk = FileOps.diskSpace()
+                }
+            }
+        } message: {
+            Text("Every file stays where it is. Selected copies become APFS clones of the copy you keep, so the data is stored once. Editing one later doesn't change the others.")
         }
         .confirmationDialog("Move \(model.selection.count) duplicate(s) to the Trash?", isPresented: $confirming) {
             Button("Move to Trash", role: .destructive) {
@@ -330,5 +345,139 @@ struct TrashBar: View {
         .padding(.horizontal, 18).padding(.vertical, 12)
         .background(.bar)
         .overlay(alignment: .top) { Divider() }
+    }
+}
+
+// MARK: - Clean history
+
+struct HistoryView: View {
+    @Environment(Store.self) private var store
+    @State private var message: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ModuleHeader(item: .history, subtitle: "Everything DevSweep moved to the Trash in the last 30 days. Put any clean back with one click.",
+                         value: store.history.reduce(0) { $0 + $1.bytes })
+            if let message { Text(message).font(.callout).padding(8).frame(maxWidth: .infinity).background(.quaternary.opacity(0.4)) }
+            if store.history.isEmpty {
+                ContentUnavailableView("Nothing to restore", systemImage: "arrow.uturn.backward.circle",
+                                       description: Text("Cleans that go to the Trash show up here."))
+            } else {
+                List(store.history) { session in
+                    DisclosureGroup {
+                        ForEach(session.items.prefix(50), id: \.self) { item in
+                            HStack {
+                                FileIcon(url: URL(fileURLWithPath: FileManager.default.fileExists(atPath: item.trashed) ? item.trashed : "/"), size: 16)
+                                Text((item.original as NSString).abbreviatingWithTildeInPath).font(.caption).lineLimit(1).truncationMode(.middle)
+                                Spacer()
+                                if !FileManager.default.fileExists(atPath: item.trashed) { Tag(text: "Trash emptied", color: .secondary) }
+                                Text(item.bytes.byteString).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                            }
+                        }
+                        if session.items.count > 50 { Text("+ \(session.items.count - 50) more").font(.caption).foregroundStyle(.secondary) }
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(session.label).fontWeight(.medium).lineLimit(1)
+                                Text("\(session.date.formatted(date: .abbreviated, time: .shortened)) · \(session.items.count) items · \(session.restorable.count) still in Trash")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(session.bytes.byteString).monospacedDigit()
+                            Button("Restore") {
+                                let result = CleanHistory.restore(session)
+                                message = "Restored \(result.restored) item(s)" + (result.skipped > 0 ? ", skipped \(result.skipped) (already back or emptied)" : "")
+                                store.history = CleanHistory.load()
+                            }
+                            .disabled(session.restorable.isEmpty)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Clean History")
+        .onAppear { store.history = CleanHistory.load() }
+    }
+}
+
+// MARK: - Shredder
+
+struct ShredderView: View {
+    @Environment(Store.self) private var store
+    @State private var confirming = false
+    @State private var targeted = false
+    private var model: ShredderModel { store.shredder }
+
+    var body: some View {
+        @Bindable var model = store.shredder
+        VStack(spacing: 0) {
+            ModuleHeader(item: .shredder, subtitle: "Erase files so they don't go to the Trash. Drop files or folders below.", value: model.files.isEmpty ? nil : model.total)
+            Picker("Mode", selection: $model.mode) {
+                ForEach(ShredderModel.Mode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented).padding(.horizontal, 16).padding(.top, 10)
+            Text(model.mode.detail).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Divider()
+            Group {
+                if model.files.isEmpty {
+                    VStack(spacing: 14) {
+                        Image(systemName: "scissors").font(.system(size: 48)).foregroundStyle(.secondary)
+                        Text("Drop files here").font(.title3.weight(.semibold))
+                        Button("Choose Files…", action: pick)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(targeted ? Color.accentColor.opacity(0.08) : .clear)
+                } else {
+                    List {
+                        ForEach(model.files, id: \.self) { url in
+                            HStack {
+                                FileIcon(url: url, size: 22)
+                                Text(url.lastPathComponent)
+                                Text(url.deletingLastPathComponent().tildePath).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                Spacer()
+                                Text(FileOps.size(of: url).byteString).foregroundStyle(.secondary).monospacedDigit()
+                                Button { model.files.removeAll { $0 == url } } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                }
+            }
+            .onDrop(of: [.fileURL], isTargeted: $targeted) { providers in
+                for provider in providers {
+                    _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                        if let url { Task { @MainActor in store.shredder.add([url]) } }
+                    }
+                }
+                return true
+            }
+        }
+        .navigationTitle("Shredder")
+        .toolbar { Button("Add Files…", systemImage: "plus", action: pick) }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack {
+                Text("\(model.files.count) item(s) · \(model.total.byteString)").foregroundStyle(.secondary)
+                Spacer()
+                Button(role: .destructive) { confirming = true } label: { Label("Shred", systemImage: "scissors").padding(.horizontal, 6) }
+                    .buttonStyle(.borderedProminent).tint(.red).controlSize(.large)
+                    .disabled(model.files.isEmpty || model.isRunning)
+            }
+            .padding(14).background(.bar)
+        }
+        .confirmationDialog("Shred \(model.files.count) item(s)?", isPresented: $confirming) {
+            Button(model.mode.rawValue, role: .destructive) {
+                Task { store.log.insert(contentsOf: await model.shred(), at: 0) }
+            }
+        } message: {
+            Text(model.mode == .trash ? "They go to the Trash." : "This can't be undone.")
+        }
+    }
+
+    private func pick() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK { model.add(panel.urls) }
     }
 }

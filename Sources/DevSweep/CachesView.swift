@@ -417,9 +417,14 @@ struct TargetRow: View {
     @ViewBuilder
     private var expandedContent: some View {
         if !target.supportsChildren {
+            let urls = target.existingURLs
             VStack(spacing: 4) {
-                ForEach(target.existingURLs, id: \.self) { url in
+                ForEach(urls.prefix(40), id: \.self) { url in
                     PathRow(url: url, bytes: store.pathSizes[url])
+                }
+                if urls.count > 40 {
+                    Text("+ \(urls.count - 40) more").font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         } else if let children {
